@@ -7,21 +7,12 @@ from torch import nn
 # ============================================================
 
 class GatingBlock(nn.Module):
-    """
-    XLinear-style gating block.
-
-    MLP with sigmoid produces a per-dimension multiplicative gate applied to
-    the input. Richer than a scalar gate — every feature dimension gets its
-    own context-dependent suppression / amplification.
-
-    Architecture: Linear → ReLU → (Dropout) → Linear → Sigmoid → ⊗ input
-    """
-    def __init__(self, d_model, hidden_dim, dropout=0.0):
+    """XLinear-style gating block. Linear → ReLU → Linear → Sigmoid → ⊗ input."""
+    def __init__(self, d_model, hidden_dim):
         super(GatingBlock, self).__init__()
         self.gate = nn.Sequential(
             nn.Linear(d_model, hidden_dim),
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout) if dropout > 0.0 else nn.Identity(),
             nn.Linear(hidden_dim, d_model),
             nn.Sigmoid(),
         )
@@ -31,12 +22,7 @@ class GatingBlock(nn.Module):
 
 
 class InterPatchGating(nn.Module):
-    """
-    GLCN-inspired inter-patch gating module (unchanged from v8).
-
-    Captures global patch-level dynamics:
-    GlobalAvgPool (over features) → MLP → Sigmoid → element-wise scaling.
-    """
+    """GLCN-inspired inter-patch gating (unchanged from v8)."""
     def __init__(self, patch_num, reduction=4):
         super(InterPatchGating, self).__init__()
         hidden = max(patch_num // reduction, 2)
@@ -48,67 +34,68 @@ class InterPatchGating(nn.Module):
         )
 
     def forward(self, x):
-        # x: [B*C, patch_num, patch_len]
-        w = x.mean(dim=2)           # GAP over features → [B*C, patch_num]
-        w = self.mlp(w).unsqueeze(2)  # weights → [B*C, patch_num, 1]
+        w = x.mean(dim=2)
+        w = self.mlp(w).unsqueeze(2)
         return x * w
 
 
 class VariateWiseGating(nn.Module):
     """
-    XLinear-inspired Variate-Wise Gating Module (VGM) — v9 addition.
+    Variate-Wise Gating Module (VGM) — v9 addition.
 
-    Breaks channel independence by letting every channel's seasonal forecast
-    attend to all other channels via a trend-derived global token.
+    WHY THE FIRST ATTEMPT FAILED
+    -----------------------------
+    The previous VGM operated on pred_len-dimensional prediction outputs with
+    a Linear(2C) layer gating across all channels. For Traffic (C=862) this
+    meant a 1724-dim linear layer operating directly on predictions — it could
+    only inject noise. More fundamentally, XLinear's VGM operates in compact
+    d_model embedding space BEFORE the prediction head, not on pred_len outputs.
 
-    Design choices:
-      - trend output t [B, C, P] serves as the global token (hub), since the
-        trend stream captures slow persistent structure — a principled choice
-        grounded in the EMA decomposition.
-      - GatingBlock operates on the variate dimension (2C), so each prediction
-        timestep decides independently how to mix cross-channel information.
-      - Hidden dim is capped at vgm_hidden (default 256) so Traffic/Electricity
-        (C=862/321) don't blow up parameter counts.
-      - Output projection fuses [temporal, cross-variate] back to pred_len.
+    THIS REDESIGN
+    -------------
+    1. Compact embedding space:
+       Projects pred_len → vgm_emb_dim (default 64) before cross-channel
+       interaction. GatingBlock sees 2*vgm_emb_dim vectors — small and constant
+       regardless of C. Mirrors XLinear operating on d_model embeddings.
 
-    Args:
-        channel   (int): number of input channels C
-        pred_len  (int): prediction horizon P
-        vgm_hidden(int): cap on GatingBlock hidden dim (default 256)
+    2. Scalable cross-channel aggregation:
+       Uses mean-pooled trend as global context hub rather than a Linear(2C)
+       layer. Each channel gates on [own_seasonal_emb, global_trend_context].
+       GatingBlock size = 2*E regardless of whether C=7 or C=862.
+
+    3. Zero-initialized residual:
+       out_proj starts at zero — VGM begins as exact identity, adds cross-
+       channel signal gradually as training proceeds. No destabilization at init.
     """
-    def __init__(self, channel, pred_len, vgm_hidden=256):
+    def __init__(self, pred_len, vgm_emb_dim=64):
         super(VariateWiseGating, self).__init__()
-        d_variate = 2 * channel
-        hf = min(d_variate, vgm_hidden)
-        # GatingBlock sees [B, pred_len, 2C] — gates across the variate dim
-        self.gating = GatingBlock(d_variate, hf)
-        # Fuse temporal + cross-variate into pred_len
-        self.proj = nn.Linear(2 * pred_len, pred_len)
+        self.vgm_emb_dim = vgm_emb_dim
+
+        self.s_proj = nn.Linear(pred_len, vgm_emb_dim)
+        self.t_proj = nn.Linear(pred_len, vgm_emb_dim)
+        # GatingBlock on [own_seasonal_emb, global_trend_ctx]: size 2E, constant
+        self.gating = GatingBlock(2 * vgm_emb_dim, vgm_emb_dim)
+        # Zero-init: VGM starts as identity residual
+        self.out_proj = nn.Linear(vgm_emb_dim, pred_len)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, s, t_glob):
-        """
-        s:       seasonal features  [B, C, pred_len]
-        t_glob:  trend global token [B, C, pred_len]
+        """s, t_glob: [B, C, pred_len] → returns [B, C, pred_len]"""
+        s_emb = self.s_proj(s)                                  # [B, C, E]
+        t_emb = self.t_proj(t_glob)                             # [B, C, E]
 
-        Returns: s_enhanced [B, C, pred_len]
-        """
-        B, C, P = s.shape
+        # Mean-pool trend across channels → global context hub
+        global_ctx = t_emb.mean(dim=1, keepdim=True).expand_as(t_emb)  # [B, C, E]
 
-        # Stack seasonal + trend-glob along channel dim
-        ex_emb = torch.cat([s, t_glob], dim=1)            # [B, 2C, P]
+        # Each channel gates independently on its own + global context
+        combined = torch.cat([s_emb, global_ctx], dim=-1)      # [B, C, 2E]
+        gated = self.gating(combined)                           # [B, C, 2E]
+        cross_info = gated[..., :self.vgm_emb_dim]             # [B, C, E]
 
-        # Variate-wise gating: transpose so GatingBlock gates across 2C
-        ex_atten = self.gating(ex_emb.permute(0, 2, 1))   # [B, P, 2C]
-        ex_atten = ex_atten.permute(0, 2, 1)              # [B, 2C, P]
-
-        # Extract cross-variate information carried in the trend-glob half
-        cross_info = ex_atten[:, C:, :]                   # [B, C, P]
-
-        # Fuse: concatenate temporal + cross-variate, project back
-        s_enhanced = torch.cat([s, cross_info], dim=-1)   # [B, C, 2P]
-        s_enhanced = self.proj(s_enhanced)                # [B, C, P]
-
-        return s_enhanced
+        # Zero-init residual: starts at 0, learns cross-channel delta
+        delta = self.out_proj(cross_info)                       # [B, C, pred_len]
+        return s + delta
 
 
 # ============================================================
@@ -117,40 +104,35 @@ class VariateWiseGating(nn.Module):
 
 class GLPatchNetwork(nn.Module):
     """
-    GLPatch v9 — XLinear-inspired cross-channel gating on top of v8.
+    GLPatch v9 — VGM added to v8's proven backbone.
 
-    Three improvements over v8
-    --------------------------
-    1. VariateWiseGating (VGM):
-       After both streams are computed, reshapes back to [B, C, pred_len] and
-       applies cross-channel gating before fusion. Directly addresses Solar,
-       Traffic, and Weather long-horizon failures caused by channel independence.
+    One change over v8
+    ------------------
+    VariateWiseGating (VGM): after both streams compute per-channel predictions,
+    each channel enriches its seasonal output with a global trend-derived
+    cross-channel context, before the v8 bottleneck fusion.
 
-    2. Trend-as-global-token:
-       The VGM uses the trend stream output as its global hub token rather
-       than a learned ones-initialised parameter. Trend captures slow, persistent
-       per-channel structure — a principled choice aligned with the EMA
-       decomposition philosophy. No extra parameters required.
+    Everything else is IDENTICAL to v8:
+    - Inter-patch gating (GLCN, pre-pointwise, alpha=0.05)
+    - Bottleneck fusion (H→32→H, gate constrained [0.1, 0.9], same init)
+    - Same weight inits, same architecture
 
-    3. Full GatingBlock stream fusion:
-       Replaces the constrained bottleneck gate (H→32→H, g∈[0.1,0.9]) with
-       XLinear's GatingBlock on cat([s, t]). Per-dimension gating, no
-       hardcoded constraint, hidden dim = pred_len (still regularised vs v7's
-       full-rank Linear(pred_len, pred_len) gates).
-
-    Everything else is identical to v8.
+    Note: GatingBlock stream fusion (improvement 3 from original plan) is NOT
+    included. The v8 bottleneck fusion has careful initialization that keeps
+    training stable; the GatingBlock fusion used PyTorch default init which
+    destabilized early training. Revert to v8 fusion only.
 
     Args:
-        seq_len    (int): input sequence length
-        pred_len   (int): prediction horizon
-        patch_len  (int): patch size
-        stride     (int): patch stride
+        seq_len     (int): input sequence length
+        pred_len    (int): prediction horizon
+        patch_len   (int): patch size
+        stride      (int): patch stride
         padding_patch (str): 'end' to pad input before patching
-        channel    (int): number of input channels C (needed for VGM)
-        vgm_hidden (int): cap on VGM GatingBlock hidden dim (default 256)
+        channel     (int): number of input channels C
+        vgm_emb_dim (int): embedding dim for VGM cross-channel interaction (default 64)
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch,
-                 channel=1, vgm_hidden=256):
+                 channel=1, vgm_emb_dim=64):
         super(GLPatchNetwork, self).__init__()
 
         self.pred_len = pred_len
@@ -159,12 +141,10 @@ class GLPatchNetwork(nn.Module):
         self.padding_patch = padding_patch
         self.dim = patch_len * patch_len
         self.patch_num = (seq_len - patch_len) // stride + 1
-        self.channel = channel
 
         # ================================================================
         # Non-linear Stream (Seasonality) — identical to v8
         # ================================================================
-
         if padding_patch == 'end':
             self.padding_patch_layer = nn.ReplicationPad1d((0, stride))
             self.patch_num += 1
@@ -180,7 +160,6 @@ class GLPatchNetwork(nn.Module):
 
         self.fc2 = nn.Linear(self.dim, patch_len)
 
-        # Inter-patch gating (v8, unchanged)
         self.inter_patch_gate = InterPatchGating(self.patch_num, reduction=4)
         self.res_alpha = nn.Parameter(torch.tensor(0.05))
 
@@ -207,110 +186,79 @@ class GLPatchNetwork(nn.Module):
         self.fc7 = nn.Linear(pred_len // 2, pred_len)
 
         # ================================================================
-        # [v9 — Improvement 1+2] Variate-Wise Gating
-        # Only active when C > 1; for C=1 the module is a no-op (VGM with
-        # a single channel degenerates to self-gating, harmless but pointless,
-        # so we skip it for univariate datasets).
+        # [v9] Variate-Wise Gating
         # ================================================================
         self.use_vgm = (channel > 1)
         if self.use_vgm:
-            self.vgm = VariateWiseGating(channel, pred_len, vgm_hidden)
+            self.vgm = VariateWiseGating(pred_len, vgm_emb_dim)
 
         # ================================================================
-        # [v9 — Improvement 3] Full GatingBlock Stream Fusion
-        # Replaces: bottleneck (H→32→H) + hardcoded constraint [0.1, 0.9]
-        # With:     GatingBlock(2*pred_len, pred_len) + linear projection
-        #
-        # Parameter comparison (pred_len=720):
-        #   v8:  (720*32 + 32*720)*2 + 32*720 = ~115K
-        #   v9:  2*(1440*720) + (1440*720) = ~3.1M
-        # Still far less than v5-v7 full-rank gates (~1M for fusion alone
-        # at pred_len=720), and the GatingBlock's ReLU bottleneck provides
-        # natural regularisation without a hardcoded constraint.
+        # Bottleneck Fusion — identical to v8
         # ================================================================
-        self.fusion_gate = GatingBlock(pred_len * 2, pred_len)
-        self.fusion_proj = nn.Linear(pred_len * 2, pred_len)
+        gate_hidden = min(32, pred_len)
+        self.gate_compress_s = nn.Linear(pred_len, gate_hidden)
+        self.gate_compress_t = nn.Linear(pred_len, gate_hidden)
+        self.gate_expand = nn.Linear(gate_hidden, pred_len)
 
-        # Final projection (v8 style)
+        nn.init.normal_(self.gate_compress_s.weight, std=0.01)
+        nn.init.normal_(self.gate_compress_t.weight, std=0.01)
+        nn.init.normal_(self.gate_expand.weight, std=0.01)
+        nn.init.zeros_(self.gate_compress_s.bias)
+        nn.init.zeros_(self.gate_compress_t.bias)
+        nn.init.zeros_(self.gate_expand.bias)
+
         self.fc8 = nn.Linear(pred_len, pred_len)
 
     def forward(self, s, t):
-        # s: seasonality [B, T, C]
-        # t: trend       [B, T, C]
-
-        s = s.permute(0, 2, 1)   # [B, C, T]
-        t = t.permute(0, 2, 1)   # [B, C, T]
+        s = s.permute(0, 2, 1)
+        t = t.permute(0, 2, 1)
 
         B, C, I = s.shape
-
-        # Flatten channels for per-channel (CI) processing
-        s = s.reshape(B * C, I)   # [B*C, T]
-        t = t.reshape(B * C, I)   # [B*C, T]
+        s = s.reshape(B * C, I)
+        t = t.reshape(B * C, I)
 
         # ---- Non-linear Stream ----
-
         if self.padding_patch == 'end':
             s = self.padding_patch_layer(s)
         s = s.unfold(dimension=-1, size=self.patch_len, step=self.stride)
 
-        s = self.fc1(s)
-        s = self.gelu1(s)
-        s = self.bn1(s)
-
+        s = self.fc1(s);  s = self.gelu1(s);  s = self.bn1(s)
         res = s
-
-        s = self.conv1(s)
-        s = self.gelu2(s)
-        s = self.bn2(s)
-
+        s = self.conv1(s); s = self.gelu2(s); s = self.bn2(s)
         res = self.fc2(res)
         s = s + res
 
-        # Inter-patch gating (v8)
         s_base = s
         s_gated = self.inter_patch_gate(s)
         s = s_base + self.res_alpha * (s_gated - s_base)
 
-        s = self.conv2(s)
-        s = self.gelu3(s)
-        s = self.bn3(s)
-
+        s = self.conv2(s); s = self.gelu3(s); s = self.bn3(s)
         s = self.flatten1(s)
-        s = self.fc3(s)
-        s = self.gelu4(s)
-        s = self.fc4(s)             # s: [B*C, pred_len]
+        s = self.fc3(s);  s = self.gelu4(s);  s = self.fc4(s)  # [B*C, P]
 
         # ---- Linear Stream ----
-
-        t = self.fc5(t)
-        t = self.avgpool1(t)
-        t = self.ln1(t)
-        t = self.fc6(t)
-        t = self.avgpool2(t)
-        t = self.ln2(t)
-        t = self.fc7(t)             # t: [B*C, pred_len]
+        t = self.fc5(t);  t = self.avgpool1(t);  t = self.ln1(t)
+        t = self.fc6(t);  t = self.avgpool2(t);  t = self.ln2(t)
+        t = self.fc7(t)                                         # [B*C, P]
 
         # ---- [v9] Variate-Wise Gating ----
-        # Break out of B*C to enable cross-channel interaction.
-        # Trend output serves as the global token (hub) — principled by
-        # decomposition: trend = slow global signal per channel.
         if self.use_vgm:
-            s_3d = s.reshape(B, C, self.pred_len)   # [B, C, P]
-            t_3d = t.reshape(B, C, self.pred_len)   # [B, C, P]
+            s_3d = s.reshape(B, C, self.pred_len)
+            t_3d = t.reshape(B, C, self.pred_len)
+            s_3d = self.vgm(s_3d, t_3d)
+            s = s_3d.reshape(B * C, self.pred_len)
 
-            s_3d = self.vgm(s_3d, t_3d)            # [B, C, P]
+        # ---- Bottleneck Fusion (v8) ----
+        gate = torch.sigmoid(
+            self.gate_expand(
+                self.gate_compress_s(s) + self.gate_compress_t(t)
+            )
+        )
+        gate = gate * 0.8 + 0.1
 
-            s = s_3d.reshape(B * C, self.pred_len)  # back to [B*C, P]
-
-        # ---- [v9] Full GatingBlock Stream Fusion ----
-        # Per-dimension gating on cat([s, t]) — no hardcoded constraint.
-        combined = torch.cat([s, t], dim=-1)        # [B*C, 2*pred_len]
-        fused = self.fusion_gate(combined)           # [B*C, 2*pred_len]
-        x = self.fusion_proj(fused)                 # [B*C, pred_len]
-
+        x = gate * s + (1 - gate) * t
         x = self.fc8(x)
 
         x = x.reshape(B, C, self.pred_len)
-        x = x.permute(0, 2, 1)                     # [B, pred_len, C]
-
+        x = x.permute(0, 2, 1)
         return x
