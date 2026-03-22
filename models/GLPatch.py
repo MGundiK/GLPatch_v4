@@ -47,12 +47,13 @@ class Model(nn.Module):
         # vgm_hidden: cap on VGM GatingBlock hidden dim.
         # Default 256 keeps Traffic (C=862) and Electricity (C=321) efficient.
         # Can be overridden via configs.vgm_hidden if needed.
-        vgm_hidden = getattr(configs, 'vgm_hidden', 256)
-
+        # NEW
+        vgm_emb_dim = getattr(configs, 'vgm_emb_dim', 64)
+        
         self.net = GLPatchNetwork(
             seq_len, pred_len, patch_len, stride, padding_patch,
             channel=c_in,
-            vgm_hidden=vgm_hidden,
+            vgm_emb_dim=vgm_emb_dim,
         )
 
     def forward(self, x):
