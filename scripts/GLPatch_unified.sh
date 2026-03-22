@@ -17,7 +17,7 @@ if [ ! -d "./logs/glpatch_${ma_type}" ]; then
     mkdir ./logs/glpatch_${ma_type}
 fi
 
-model_name=GLPatch_v9
+model_name=GLPatch
 seq_len=96
 
 for pred_len in 96 192 336 720
