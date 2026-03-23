@@ -7,12 +7,12 @@ from layers.revin import RevIN
 
 class Model(nn.Module):
     """
-    GLPatch v9: patching (seasonal) + XLinear TGM/VGM (trend) hybrid.
+    GLPatch v9.1: patching (seasonal) + XLinear TGM/mean-pool-VGM (trend).
 
-    New config args vs v8 (all optional — safe defaults provided):
-        d_model  (int): trend embedding dim            default 64
-        t_ff     (int): TGM GatingBlock hidden dim     default 2*d_model
-        c_ff     (int): VGM GatingBlock hidden dim     default min(2*enc_in, 256)
+    New config args vs v8:
+        d_model  (int): trend embedding dim,        default 64
+        t_ff     (int): TGM+VGM GatingBlock hidden, default 2*d_model
+        (c_ff removed — mean-pool VGM needs no bottleneck hyperparameter)
     """
     def __init__(self, configs):
         super(Model, self).__init__()
@@ -30,17 +30,14 @@ class Model(nn.Module):
         self.ma_type = configs.ma_type
         self.decomp  = DECOMP(self.ma_type, configs.alpha, configs.beta)
 
-        # New v9 hyperparameters — read from configs with safe defaults
         d_model = getattr(configs, 'd_model', 64)
         t_ff    = getattr(configs, 't_ff',    2 * d_model)
-        c_ff    = getattr(configs, 'c_ff',    min(2 * c_in, 256))
 
         self.net = GLPatchNetwork(
             seq_len, pred_len, patch_len, stride, padding_patch,
             channel=c_in,
             d_model=d_model,
             t_ff=t_ff,
-            c_ff=c_ff,
         )
 
     def forward(self, x):
