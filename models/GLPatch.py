@@ -53,7 +53,6 @@ class Model(nn.Module):
         self.net = GLPatchNetwork(
             seq_len, pred_len, patch_len, stride, padding_patch,
             channel=c_in,
-            vgm_emb_dim=vgm_emb_dim,
         )
 
     def forward(self, x):
