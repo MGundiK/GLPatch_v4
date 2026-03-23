@@ -39,63 +39,82 @@ class InterPatchGating(nn.Module):
         return x * w
 
 
-class VariateWiseGating(nn.Module):
+class PatchCrossChannel(nn.Module):
     """
-    Variate-Wise Gating Module (VGM) — v9 addition.
+    Cross-channel gating in patch embedding space — v9 addition.
 
-    WHY THE FIRST ATTEMPT FAILED
-    -----------------------------
-    The previous VGM operated on pred_len-dimensional prediction outputs with
-    a Linear(2C) layer gating across all channels. For Traffic (C=862) this
-    meant a 1724-dim linear layer operating directly on predictions — it could
-    only inject noise. More fundamentally, XLinear's VGM operates in compact
-    d_model embedding space BEFORE the prediction head, not on pred_len outputs.
+    WHY THIS PLACEMENT IS CORRECT
+    ------------------------------
+    The v9.0 VGM failed because it operated on pred_len-dimensional prediction
+    outputs. XLinear's cross-channel interaction happens in compact d_model
+    embedding space BEFORE the prediction head — that is why it works and
+    scales. GLPatch's natural equivalent is the patch embedding space:
+    after fc1/gelu/bn1, each channel has a [patch_num, dim] representation
+    where dim = patch_len² = 256.
 
-    THIS REDESIGN
-    -------------
-    1. Compact embedding space:
-       Projects pred_len → vgm_emb_dim (default 64) before cross-channel
-       interaction. GatingBlock sees 2*vgm_emb_dim vectors — small and constant
-       regardless of C. Mirrors XLinear operating on d_model embeddings.
+    Operating here gives us:
+      - GatingBlock size = 2*dim = 512 — constant regardless of C.
+        C=7 (ETTm1) and C=862 (Traffic) see identical module sizes.
+        No hardcoded thresholds, no scaling problems.
+      - Rich features: 256-dim embeddings carry more cross-channel signal
+        than 16-dim post-CNN features or pred_len-dim predictions.
+      - Temporal locality: cross-channel gating at patch level, so each
+        patch position independently decides how much to use global context.
+        More fine-grained than mixing at the prediction level.
 
-    2. Scalable cross-channel aggregation:
-       Uses mean-pooled trend as global context hub rather than a Linear(2C)
-       layer. Each channel gates on [own_seasonal_emb, global_trend_context].
-       GatingBlock size = 2*E regardless of whether C=7 or C=862.
+    HOW IT WORKS (matching XLinear's VGM philosophy)
+    -------------------------------------------------
+    1. Each channel's patch embedding is enriched with a global context
+       vector — the mean of all channels' embeddings at each patch position.
+       Mean-pool is stable in 256-dim space (even for C=7) unlike in 1- or
+       16-dim prediction space.
+    2. GatingBlock(2*dim) gates [own_embedding, global_context] — each
+       patch token decides per-feature how much global context to absorb.
+    3. Zero-initialized out_proj: module starts as exact identity (same as
+       v8). Cross-channel signal is added only as training discovers it
+       useful. Cannot hurt at initialization.
 
-    3. Zero-initialized residual:
-       out_proj starts at zero — VGM begins as exact identity, adds cross-
-       channel signal gradually as training proceeds. No destabilization at init.
+    Args:
+        dim (int): patch embedding dimension (patch_len² = 256 by default)
     """
-    def __init__(self, pred_len, vgm_emb_dim=64):
-        super(VariateWiseGating, self).__init__()
-        self.vgm_emb_dim = vgm_emb_dim
-
-        self.s_proj = nn.Linear(pred_len, vgm_emb_dim)
-        self.t_proj = nn.Linear(pred_len, vgm_emb_dim)
-        # GatingBlock on [own_seasonal_emb, global_trend_ctx]: size 2E, constant
-        self.gating = GatingBlock(2 * vgm_emb_dim, vgm_emb_dim)
-        # Zero-init: VGM starts as identity residual
-        self.out_proj = nn.Linear(vgm_emb_dim, pred_len)
+    def __init__(self, dim):
+        super(PatchCrossChannel, self).__init__()
+        # GatingBlock size 2*dim — constant, C-independent
+        self.gating = GatingBlock(2 * dim, dim)
+        # Zero-init: starts as identity residual
+        self.out_proj = nn.Linear(dim, dim)
         nn.init.zeros_(self.out_proj.weight)
         nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, s, t_glob):
-        """s, t_glob: [B, C, pred_len] → returns [B, C, pred_len]"""
-        s_emb = self.s_proj(s)                                  # [B, C, E]
-        t_emb = self.t_proj(t_glob)                             # [B, C, E]
+    def forward(self, s, B, C):
+        """
+        s:       [B*C, patch_num, dim]
+        B, C:    batch size and channel count captured before B*C flatten
+        Returns: [B*C, patch_num, dim]  (same shape, cross-channel enriched)
+        """
+        BC, N, D = s.shape
 
-        # Mean-pool trend across channels → global context hub
-        global_ctx = t_emb.mean(dim=1, keepdim=True).expand_as(t_emb)  # [B, C, E]
+        # Expose channel dimension
+        s_4d = s.reshape(B, C, N, D)                           # [B, C, N, D]
 
-        # Each channel gates independently on its own + global context
-        combined = torch.cat([s_emb, global_ctx], dim=-1)      # [B, C, 2E]
-        gated = self.gating(combined)                           # [B, C, 2E]
-        cross_info = gated[..., :self.vgm_emb_dim]             # [B, C, E]
+        # Global context: mean over channels at each patch position
+        # Stable in D=256-dim space regardless of C
+        glob = s_4d.mean(dim=1, keepdim=True).expand_as(s_4d) # [B, C, N, D]
 
-        # Zero-init residual: starts at 0, learns cross-channel delta
-        delta = self.out_proj(cross_info)                       # [B, C, pred_len]
-        return s + delta
+        # Each token gates on [own_embedding, global_context]
+        combined = torch.cat([s_4d, glob], dim=-1)             # [B, C, N, 2D]
+        combined_flat = combined.reshape(B * C * N, 2 * D)
+
+        gated = self.gating(combined_flat)                     # [B*C*N, 2D]
+        gated = gated.reshape(B, C, N, 2 * D)
+
+        # Own-embedding half after gating — what this channel retains
+        cross_info = gated[..., :D]                            # [B, C, N, D]
+
+        # Zero-init residual: delta starts at 0, grows as training finds use
+        delta = self.out_proj(cross_info)                      # [B, C, N, D]
+
+        return (s_4d + delta).reshape(BC, N, D)
 
 
 # ============================================================
@@ -104,23 +123,32 @@ class VariateWiseGating(nn.Module):
 
 class GLPatchNetwork(nn.Module):
     """
-    GLPatch v9 — VGM added to v8's proven backbone.
+    GLPatch v9 — patch-level cross-channel gating on v8's backbone.
 
-    One change over v8
-    ------------------
-    VariateWiseGating (VGM): after both streams compute per-channel predictions,
-    each channel enriches its seasonal output with a global trend-derived
-    cross-channel context, before the v8 bottleneck fusion.
+    Single architectural addition over v8
+    --------------------------------------
+    PatchCrossChannel (PCCM): inserted after patch embedding (fc1/gelu/bn1)
+    in the seasonal stream. Each channel's patch embeddings are enriched with
+    a global cross-channel context before the depthwise CNN processes them.
 
-    Everything else is IDENTICAL to v8:
-    - Inter-patch gating (GLCN, pre-pointwise, alpha=0.05)
-    - Bottleneck fusion (H→32→H, gate constrained [0.1, 0.9], same init)
-    - Same weight inits, same architecture
+    This mirrors XLinear's design philosophy:
+      - XLinear: cross-channel interaction in d_model embedding space
+      - GLPatch v9: cross-channel interaction in patch embedding space (dim=256)
 
-    Note: GatingBlock stream fusion (improvement 3 from original plan) is NOT
-    included. The v8 bottleneck fusion has careful initialization that keeps
-    training stable; the GatingBlock fusion used PyTorch default init which
-    destabilized early training. Revert to v8 fusion only.
+    Both operate BEFORE the prediction head in compact embedding space.
+    This is fundamentally different from v9.0 which operated on pred_len
+    prediction outputs — the wrong space.
+
+    Key properties:
+      - GatingBlock size = 2*dim = 512, independent of C (C=7 or C=862, same)
+      - Zero-init residual: v9 == v8 at initialization
+      - Placed before depthwise CNN: cross-channel signal informs local
+        temporal feature extraction, not just the final prediction
+
+    Everything else is identical to v8:
+      - Inter-patch gating (GLCN, pre-pointwise, alpha=0.05)
+      - Bottleneck fusion (H→32→H, gate constrained [0.1, 0.9], same inits)
+      - All other layers, norms, activations
 
     Args:
         seq_len     (int): input sequence length
@@ -129,44 +157,57 @@ class GLPatchNetwork(nn.Module):
         stride      (int): patch stride
         padding_patch (str): 'end' to pad input before patching
         channel     (int): number of input channels C
-        vgm_emb_dim (int): embedding dim for VGM cross-channel interaction (default 64)
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch,
-                 channel=1, vgm_emb_dim=64):
+                 channel=1):
         super(GLPatchNetwork, self).__init__()
 
         self.pred_len = pred_len
         self.patch_len = patch_len
         self.stride = stride
         self.padding_patch = padding_patch
-        self.dim = patch_len * patch_len
+        self.dim = patch_len * patch_len          # 256 for patch_len=16
         self.patch_num = (seq_len - patch_len) // stride + 1
+        self.channel = channel
 
         # ================================================================
-        # Non-linear Stream (Seasonality) — identical to v8
+        # Non-linear Stream (Seasonality)
         # ================================================================
         if padding_patch == 'end':
             self.padding_patch_layer = nn.ReplicationPad1d((0, stride))
             self.patch_num += 1
 
+        # Patch embedding (from xPatch)
         self.fc1 = nn.Linear(patch_len, self.dim)
         self.gelu1 = nn.GELU()
         self.bn1 = nn.BatchNorm1d(self.patch_num)
 
+        # [v9] Cross-channel gating in patch embedding space
+        # Placed here: after embedding, before CNN, in 256-dim space
+        # Only meaningful when C > 1
+        self.use_pccm = (channel > 1)
+        if self.use_pccm:
+            self.pccm = PatchCrossChannel(self.dim)
+
+        # CNN Depthwise (from xPatch)
         self.conv1 = nn.Conv1d(self.patch_num, self.patch_num,
                                patch_len, patch_len, groups=self.patch_num)
         self.gelu2 = nn.GELU()
         self.bn2 = nn.BatchNorm1d(self.patch_num)
 
+        # Residual (from xPatch)
         self.fc2 = nn.Linear(self.dim, patch_len)
 
+        # Inter-patch gating (v8, unchanged — within-channel, pre-pointwise)
         self.inter_patch_gate = InterPatchGating(self.patch_num, reduction=4)
         self.res_alpha = nn.Parameter(torch.tensor(0.05))
 
+        # CNN Pointwise (from xPatch)
         self.conv2 = nn.Conv1d(self.patch_num, self.patch_num, 1, 1)
         self.gelu3 = nn.GELU()
         self.bn3 = nn.BatchNorm1d(self.patch_num)
 
+        # Flatten head (from xPatch)
         self.flatten1 = nn.Flatten(start_dim=-2)
         self.fc3 = nn.Linear(self.patch_num * patch_len, pred_len * 2)
         self.gelu4 = nn.GELU()
@@ -186,13 +227,6 @@ class GLPatchNetwork(nn.Module):
         self.fc7 = nn.Linear(pred_len // 2, pred_len)
 
         # ================================================================
-        # [v9] Variate-Wise Gating
-        # ================================================================
-        self.use_vgm = (channel > 1)
-        if self.use_vgm:
-            self.vgm = VariateWiseGating(pred_len, vgm_emb_dim)
-
-        # ================================================================
         # Bottleneck Fusion — identical to v8
         # ================================================================
         gate_hidden = min(32, pred_len)
@@ -210,10 +244,11 @@ class GLPatchNetwork(nn.Module):
         self.fc8 = nn.Linear(pred_len, pred_len)
 
     def forward(self, s, t):
-        s = s.permute(0, 2, 1)
+        s = s.permute(0, 2, 1)   # [B, C, T]
         t = t.permute(0, 2, 1)
 
         B, C, I = s.shape
+
         s = s.reshape(B * C, I)
         t = t.reshape(B * C, I)
 
@@ -221,32 +256,53 @@ class GLPatchNetwork(nn.Module):
         if self.padding_patch == 'end':
             s = self.padding_patch_layer(s)
         s = s.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+        # s: [B*C, patch_num, patch_len]
 
-        s = self.fc1(s);  s = self.gelu1(s);  s = self.bn1(s)
+        # Patch embedding → [B*C, patch_num, dim=256]
+        s = self.fc1(s)
+        s = self.gelu1(s)
+        s = self.bn1(s)
+
+        # [v9] Cross-channel gating in 256-dim embedding space
+        # Zero-init: starts as identity. B and C passed to reshape back.
+        if self.use_pccm:
+            s = self.pccm(s, B, C)
+
         res = s
-        s = self.conv1(s); s = self.gelu2(s); s = self.bn2(s)
+
+        # Depthwise CNN: [B*C, patch_num, dim] → [B*C, patch_num, patch_len]
+        s = self.conv1(s)
+        s = self.gelu2(s)
+        s = self.bn2(s)
+
+        # Residual: fc2 maps dim → patch_len to match conv1 output
         res = self.fc2(res)
         s = s + res
 
+        # Inter-patch gating (v8): within-channel, pre-pointwise
         s_base = s
         s_gated = self.inter_patch_gate(s)
         s = s_base + self.res_alpha * (s_gated - s_base)
 
-        s = self.conv2(s); s = self.gelu3(s); s = self.bn3(s)
+        # Pointwise CNN
+        s = self.conv2(s)
+        s = self.gelu3(s)
+        s = self.bn3(s)
+
+        # Flatten head → [B*C, pred_len]
         s = self.flatten1(s)
-        s = self.fc3(s);  s = self.gelu4(s);  s = self.fc4(s)  # [B*C, P]
+        s = self.fc3(s)
+        s = self.gelu4(s)
+        s = self.fc4(s)
 
         # ---- Linear Stream ----
-        t = self.fc5(t);  t = self.avgpool1(t);  t = self.ln1(t)
-        t = self.fc6(t);  t = self.avgpool2(t);  t = self.ln2(t)
-        t = self.fc7(t)                                         # [B*C, P]
-
-        # ---- [v9] Variate-Wise Gating ----
-        if self.use_vgm:
-            s_3d = s.reshape(B, C, self.pred_len)
-            t_3d = t.reshape(B, C, self.pred_len)
-            s_3d = self.vgm(s_3d, t_3d)
-            s = s_3d.reshape(B * C, self.pred_len)
+        t = self.fc5(t)
+        t = self.avgpool1(t)
+        t = self.ln1(t)
+        t = self.fc6(t)
+        t = self.avgpool2(t)
+        t = self.ln2(t)
+        t = self.fc7(t)
 
         # ---- Bottleneck Fusion (v8) ----
         gate = torch.sigmoid(
@@ -254,7 +310,7 @@ class GLPatchNetwork(nn.Module):
                 self.gate_compress_s(s) + self.gate_compress_t(t)
             )
         )
-        gate = gate * 0.8 + 0.1
+        gate = gate * 0.8 + 0.1   # constrain to [0.1, 0.9]
 
         x = gate * s + (1 - gate) * t
         x = self.fc8(x)
