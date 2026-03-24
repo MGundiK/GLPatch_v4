@@ -39,101 +39,63 @@ class InterPatchGating(nn.Module):
         return x * w
 
 
-class TrendStream(nn.Module):
+class VariateWiseGating(nn.Module):
     """
-    XLinear-inspired trend stream with mean-pool VGM.
+    Mean-pool VGM operating on the MLP trend stream output.
 
-    TGM (Time-wise Gating Module) — unchanged from v9.0
-    -------------------------------------------------------
-    Linear(seq_len → d_model) embeds each channel's full sequence.
-    Concatenated with a learnable global token [1, C, d_model] (ones init),
-    passed through GatingBlock(2*d_model, t_ff), then split into:
-      - origin_atten: temporally-enriched per-channel embedding
-      - glob_atten:   updated global token carrying temporal summary
+    WHY pred_len SPACE WORKS HERE (unlike v9.0)
+    --------------------------------------------
+    v9.0 failed because it used Linear(2C) across channels — lossy bottleneck
+    for large C. The GatingBlock size scaled with C, breaking Traffic/Electricity.
 
-    VGM (Variate-wise Gating Module) — redesigned
-    -----------------------------------------------
-    Previous design: cat([emb, glob_atten], dim=1) → [B, 2C, d_model]
-    → permute → GatingBlock(2C, c_ff). This required c_ff ≥ 2C to avoid
-    lossy bottleneck. Traffic (2C=1724) with c_ff=256 threw away 85% of
-    cross-channel information, causing +5-10% MAE regression.
+    Here the GatingBlock is always GatingBlock(2*pred_len, vgm_ff) — constant
+    regardless of C. For pred_len=96: 192-dim. For pred_len=720: 1440-dim.
+    C=7 or C=862, same module size. No bottleneck, no C-dependent scaling.
 
-    New design: mean-pool glob_atten across channels → global context hub.
-    Each channel gates on [own_origin_atten, global_ctx] independently.
-    GatingBlock size = 2*d_model — constant, C-independent.
+    WHY MEAN-POOL IS STABLE IN pred_len SPACE
+    ------------------------------------------
+    The xPatch MLP has already processed each channel's full temporal sequence
+    into a pred_len-dimensional prediction embedding. Mean-pooling these
+    embeddings across C channels gives a meaningful global forecast context:
+    the "average prediction" across all channels, which captures shared
+    temporal patterns and common trends. This is a 96-dim or 720-dim vector —
+    rich, not a scalar — so the mean is stable even for C=7.
 
-    Why mean-pool is correct here (unlike in pred_len space):
-      - glob_atten is d_model-dimensional (64) per channel, not scalar.
-        Mean over C of 64-dim vectors is a stable, information-rich summary
-        regardless of whether C=7 or C=862.
-      - The TGM has already encoded each channel's temporal structure into
-        glob_atten. Mean-pooling these summaries gives a meaningful global
-        temporal context, not just noise.
-      - Each channel gates independently: [own_temporal, global_temporal]
-        via GatingBlock(2*d_model). This is the same size as TGM — no new
-        hyperparameter, no C-dependent scaling.
-
-    Complexity:
-      TGM: O(B × C × d_model²)  — same as before
-      VGM: O(B × C × d_model²)  — same as TGM, replaces O(B × d_model × C²)
-      For Traffic C=862: ~26M ops vs previous ~480M ops. 18× cheaper.
-      No c_ff hyperparameter needed.
+    ZERO-INIT RESIDUAL
+    ------------------
+    out_proj is zero-initialized: at init, VGM output = 0, module is identity.
+    The model first learns to match v8 (MLP trend) performance, then gradually
+    learns to use cross-channel signal. Cannot hurt at initialization.
 
     Args:
-        seq_len  (int): input sequence length
-        pred_len (int): prediction horizon
-        channel  (int): number of input channels C
-        d_model  (int): embedding dimension
-        t_ff     (int): GatingBlock hidden dim for both TGM and VGM
+        pred_len (int): prediction horizon (GatingBlock input dim = 2*pred_len)
+        vgm_ff   (int): GatingBlock hidden dim, default pred_len
     """
-    def __init__(self, seq_len, pred_len, channel, d_model, t_ff):
-        super(TrendStream, self).__init__()
-        self.d_model = d_model
-        self.channel = channel
-
-        # Full-sequence linear projection per channel
-        self.projection = nn.Linear(seq_len, d_model)
-
-        # Learnable global token — ones init (XLinear)
-        self.glob_token = nn.Parameter(torch.ones(1, channel, d_model))
-
-        # TGM: temporal gating on [emb, glob_token]
-        self.tgm = GatingBlock(2 * d_model, t_ff)
-
-        # VGM: per-channel gating on [own_temporal, global_ctx]
-        # Size 2*d_model — constant, independent of C
-        self.vgm = GatingBlock(2 * d_model, t_ff)
-
-        # Prediction head: [B, C, 2*d_model] → [B, C, pred_len]
-        self.head = nn.Linear(2 * d_model, pred_len)
+    def __init__(self, pred_len, vgm_ff=None):
+        super(VariateWiseGating, self).__init__()
+        if vgm_ff is None:
+            vgm_ff = pred_len
+        self.gating   = GatingBlock(2 * pred_len, vgm_ff)
+        self.out_proj = nn.Linear(pred_len, pred_len)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, t):
-        """t: [B, C, seq_len]  →  returns [B*C, pred_len]"""
-        B, C, _ = t.shape
+        """
+        t: [B, C, pred_len]  →  [B, C, pred_len]  (residual addition)
+        """
+        # Mean-pool MLP outputs across channels → global forecast context
+        global_ctx = t.mean(dim=1, keepdim=True).expand_as(t)  # [B, C, pred_len]
 
-        # Linear embed: [B, C, d_model]
-        emb = self.projection(t)
+        # Each channel gates on [own_forecast, global_ctx]
+        combined = torch.cat([t, global_ctx], dim=-1)           # [B, C, 2*pred_len]
+        gated    = self.gating(combined)                        # [B, C, 2*pred_len]
 
-        # ── TGM ──────────────────────────────────────────────
-        glob = self.glob_token.expand(B, -1, -1)            # [B, C, d_model]
-        en_emb   = torch.cat([emb, glob], dim=-1)           # [B, C, 2*d_model]
-        en_atten = self.tgm(en_emb)                         # [B, C, 2*d_model]
-        origin_atten = en_atten[:, :, :self.d_model]        # [B, C, d_model]
-        glob_atten   = en_atten[:, :, self.d_model:]        # [B, C, d_model]
+        # Own-forecast half after gating
+        cross_info = gated[..., :t.shape[-1]]                   # [B, C, pred_len]
 
-        # ── VGM (mean-pool) ───────────────────────────────────
-        # Global context: mean of updated global tokens across channels
-        # Stable in d_model=64 space regardless of C (no bottleneck)
-        global_ctx = glob_atten.mean(dim=1, keepdim=True)   # [B, 1, d_model]
-        global_ctx = global_ctx.expand_as(origin_atten)     # [B, C, d_model]
-
-        # Each channel gates independently on [own_temporal, global_ctx]
-        vgm_in  = torch.cat([origin_atten, global_ctx], dim=-1)  # [B, C, 2*d_model]
-        vgm_out = self.vgm(vgm_in)                               # [B, C, 2*d_model]
-
-        # ── Head ─────────────────────────────────────────────
-        # [B, C, pred_len] → [B*C, pred_len]
-        return self.head(vgm_out).reshape(B * C, -1)
+        # Zero-init residual: starts at 0, grows as training finds cross-channel signal
+        return t + self.out_proj(cross_info)                    # [B, C, pred_len]
 
 
 # ============================================================
@@ -142,47 +104,61 @@ class TrendStream(nn.Module):
 
 class GLPatchNetwork(nn.Module):
     """
-    GLPatch v9.1 — patching + XLinear TGM/mean-pool-VGM hybrid.
+    GLPatch v9.2 — xPatch MLP trend stream + mean-pool VGM.
+
+    What changed vs v8
+    ------------------
+    One addition: VariateWiseGating (VGM) inserted after the xPatch trend
+    stream MLP, before fusion. Everything else — seasonal stream, MLP trend
+    stream, bottleneck fusion — is byte-for-byte identical to v8.
+
+    Why this design (ablation conclusion)
+    --------------------------------------
+    The TGM+VGM approach in v9.0/v9.1 replaced xPatch's 3-layer MLP trend
+    stream with TGM. Ablation showed the regression on ETTh/ETTm was caused
+    by this replacement — TGM-only loses to v8 on ETT (5W 10L MSE). The
+    xPatch MLP with AvgPool has better inductive bias for small-C datasets:
+    progressive bottleneck (seq_len→4P→2P→P) and implicit low-pass filtering.
+
+    The VGM itself was never the problem — v9mp beats TGM-only on ETTh/ETTm
+    (partial recovery). So the fix is: keep the proven MLP, add VGM on top.
 
     Architecture
     ------------
-    SEASONAL STREAM  (local temporal patterns — GLPatch strength)
+    SEASONAL STREAM  (identical to v8):
         patch → embed → depthwise CNN → inter-patch gating →
-        pointwise CNN → MLP head  [B*C, pred_len]
-        Channel-independent, O(B*C). Identical to v8.
+        pointwise CNN → MLP head  →  s [B*C, pred_len]
 
-    TREND STREAM  (global context + cross-channel — XLinear strength)
-        Linear(seq_len → d_model) → TGM → mean-pool VGM → head
-        [B*C, pred_len]
-        GatingBlock size = 2*d_model for both TGM and VGM.
-        Scales to any C with no bottleneck.
+    TREND STREAM (xPatch MLP, identical to v8):
+        fc5 → AvgPool → LN → fc6 → AvgPool → LN → fc7  →  t [B*C, pred_len]
 
-    FUSION  (v8 bottleneck, proven stable)
-        H→32→H, gate constrained [0.1, 0.9]
+    VGM (new):
+        reshape t to [B, C, pred_len]
+        mean-pool across C → global_ctx [B, C, pred_len]
+        GatingBlock(2*pred_len) on [own, global_ctx]
+        zero-init residual addition
+        reshape back to [B*C, pred_len]
 
-    Hyperparameters vs v8
-    ---------------------
-        d_model  (int): trend embedding dim, default 64
-        t_ff     (int): GatingBlock hidden dim for TGM+VGM, default 2*d_model
-        (c_ff removed — no longer needed with mean-pool VGM)
+    FUSION (identical to v8):
+        bottleneck H→32→H, gate ∈ [0.1, 0.9]
+
+    New hyperparameter vs v8
+    ------------------------
+        vgm_ff (int): VGM GatingBlock hidden dim, default pred_len
+                      Only scales with pred_len, not C.
     """
     def __init__(self, seq_len, pred_len, patch_len, stride, padding_patch,
-                 channel=1, d_model=64, t_ff=None):
+                 channel=1, vgm_ff=None):
         super(GLPatchNetwork, self).__init__()
 
-        self.pred_len = pred_len
-        self.patch_len = patch_len
-        self.stride = stride
+        self.pred_len      = pred_len
+        self.patch_len     = patch_len
+        self.stride        = stride
         self.padding_patch = padding_patch
-        self.dim = patch_len * patch_len
-        self.patch_num = (seq_len - patch_len) // stride + 1
+        self.dim           = patch_len * patch_len
+        self.patch_num     = (seq_len - patch_len) // stride + 1
 
-        if t_ff is None:
-            t_ff = 2 * d_model
-
-        # ================================================================
-        # Seasonal stream — identical to v8
-        # ================================================================
+        # ── Seasonal stream — identical to v8 ─────────────────
         if padding_patch == 'end':
             self.padding_patch_layer = nn.ReplicationPad1d((0, stride))
             self.patch_num += 1
@@ -196,10 +172,10 @@ class GLPatchNetwork(nn.Module):
         self.gelu2 = nn.GELU()
         self.bn2   = nn.BatchNorm1d(self.patch_num)
 
-        self.fc2 = nn.Linear(self.dim, patch_len)
+        self.fc2   = nn.Linear(self.dim, patch_len)
 
         self.inter_patch_gate = InterPatchGating(self.patch_num, reduction=4)
-        self.res_alpha = nn.Parameter(torch.tensor(0.05))
+        self.res_alpha        = nn.Parameter(torch.tensor(0.05))
 
         self.conv2 = nn.Conv1d(self.patch_num, self.patch_num, 1, 1)
         self.gelu3 = nn.GELU()
@@ -210,16 +186,24 @@ class GLPatchNetwork(nn.Module):
         self.gelu4 = nn.GELU()
         self.fc4   = nn.Linear(pred_len * 2, pred_len)
 
-        # ================================================================
-        # Trend stream — TGM + mean-pool VGM
-        # ================================================================
-        self.trend_stream = TrendStream(
-            seq_len, pred_len, channel, d_model, t_ff
-        )
+        # ── Trend stream — identical to xPatch / v8 ───────────
+        self.fc5      = nn.Linear(seq_len, pred_len * 4)
+        self.avgpool1 = nn.AvgPool1d(kernel_size=2)
+        self.ln1      = nn.LayerNorm(pred_len * 2)
 
-        # ================================================================
-        # Bottleneck fusion — identical to v8
-        # ================================================================
+        self.fc6      = nn.Linear(pred_len * 2, pred_len)
+        self.avgpool2 = nn.AvgPool1d(kernel_size=2)
+        self.ln2      = nn.LayerNorm(pred_len // 2)
+
+        self.fc7      = nn.Linear(pred_len // 2, pred_len)
+
+        # ── VGM — cross-channel on MLP trend output ───────────
+        # Only meaningful for multivariate; skip for C=1
+        self.use_vgm = (channel > 1)
+        if self.use_vgm:
+            self.vgm = VariateWiseGating(pred_len, vgm_ff)
+
+        # ── Bottleneck fusion — identical to v8 ───────────────
         gate_hidden = min(32, pred_len)
         self.gate_compress_s = nn.Linear(pred_len, gate_hidden)
         self.gate_compress_t = nn.Linear(pred_len, gate_hidden)
@@ -235,17 +219,15 @@ class GLPatchNetwork(nn.Module):
         self.fc8 = nn.Linear(pred_len, pred_len)
 
     def forward(self, s, t):
-        s = s.permute(0, 2, 1)
-        t = t.permute(0, 2, 1)
+        s = s.permute(0, 2, 1)   # [B, C, T]
+        t = t.permute(0, 2, 1)   # [B, C, T]
 
         B, C, I = s.shape
 
-        # ---- Trend stream ----
-        t_out = self.trend_stream(t)        # [B*C, pred_len]
-
-        # ---- Seasonal stream (CI) ----
         s = s.reshape(B * C, I)
+        t = t.reshape(B * C, I)
 
+        # ── Seasonal stream ────────────────────────────────────
         if self.padding_patch == 'end':
             s = self.padding_patch_layer(s)
         s = s.unfold(dimension=-1, size=self.patch_len, step=self.stride)
@@ -262,17 +244,28 @@ class GLPatchNetwork(nn.Module):
 
         s = self.conv2(s); s = self.gelu3(s);  s = self.bn3(s)
         s = self.flatten1(s)
-        s = self.fc3(s);   s = self.gelu4(s);  s = self.fc4(s)  # [B*C, P]
+        s = self.fc3(s);   s = self.gelu4(s);  s = self.fc4(s)   # [B*C, P]
 
-        # ---- Bottleneck fusion (v8) ----
+        # ── Trend stream (xPatch MLP, identical to v8) ─────────
+        t = self.fc5(t);   t = self.avgpool1(t);  t = self.ln1(t)
+        t = self.fc6(t);   t = self.avgpool2(t);  t = self.ln2(t)
+        t = self.fc7(t)                                            # [B*C, P]
+
+        # ── VGM — cross-channel enrichment of trend output ─────
+        if self.use_vgm:
+            t_3d = t.reshape(B, C, self.pred_len)   # [B, C, P]
+            t_3d = self.vgm(t_3d)                   # [B, C, P] + cross-channel delta
+            t    = t_3d.reshape(B * C, self.pred_len)
+
+        # ── Bottleneck fusion (v8) ─────────────────────────────
         gate = torch.sigmoid(
             self.gate_expand(
-                self.gate_compress_s(s) + self.gate_compress_t(t_out)
+                self.gate_compress_s(s) + self.gate_compress_t(t)
             )
         )
-        gate = gate * 0.8 + 0.1
+        gate = gate * 0.8 + 0.1   # constrain to [0.1, 0.9]
 
-        x = gate * s + (1 - gate) * t_out
+        x = gate * s + (1 - gate) * t
         x = self.fc8(x)
 
         x = x.reshape(B, C, self.pred_len)
