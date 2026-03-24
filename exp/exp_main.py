@@ -1,7 +1,8 @@
 from data_provider.data_factory import data_provider
 from exp.exp_basic import Exp_Basic
 from models import xPatch
-from models import GLPatch
+from models import GLPatchž
+from models import GLPatch_tgm_only
 from utils.tools import EarlyStopping, adjust_learning_rate, visual
 from utils.metrics import metric
 
@@ -25,6 +26,7 @@ class Exp_Main(Exp_Basic):
         model_dict = {
             'xPatch': xPatch,
             'GLPatch': GLPatch,
+            'GLPatch_tgm_only':GLPatch_tgm_only
         }
         model = model_dict[self.args.model].Model(self.args).float()
 
