@@ -1,46 +1,55 @@
+import torch
 import torch.nn as nn
 
 from layers.decomp import DECOMP
-from layers.network_glpatch import GLPatchNetwork
+# from layers.network_glpatch_v5 import GLPatchNetwork # use version 5
+# from layers.network_glpatch_v9 import GLPatchNetwork # use version 9
+
+from layers.network_glpatch import GLPatchNetwork # use  version 8
 from layers.revin import RevIN
 
 
 class Model(nn.Module):
     """
-    GLPatch v9.2: xPatch MLP trend stream + mean-pool VGM.
-
-    Identical to v8 except for one addition: VariateWiseGating applied to
-    the MLP trend output before fusion. The MLP trend stream is unchanged.
-
-    New config arg vs v8:
-        vgm_ff (int): VGM GatingBlock hidden dim, default = pred_len
-                      Scales with pred_len only, not with C.
+    GLPatch: Global-Local Patch model for Long-Term Time Series Forecasting.
+    
+    Combines the best of xPatch (EMA decomposition, dual-stream, overlapping
+    patches, depthwise-separable convolutions) with GLCN innovations (aggregate
+    Conv1D, inter-patch gating, multiscale local convolutions).
+    
+    Drop-in replacement for xPatch — uses identical configs, decomposition,
+    RevIN normalization, and training pipeline.
     """
     def __init__(self, configs):
         super(Model, self).__init__()
 
-        seq_len       = configs.seq_len
-        pred_len      = configs.pred_len
-        c_in          = configs.enc_in
-        patch_len     = configs.patch_len
-        stride        = configs.stride
+        # Parameters
+        seq_len = configs.seq_len
+        pred_len = configs.pred_len
+        c_in = configs.enc_in
+
+        # Patching
+        patch_len = configs.patch_len
+        stride = configs.stride
         padding_patch = configs.padding_patch
 
-        self.revin       = configs.revin
+        # Normalization
+        self.revin = configs.revin
         self.revin_layer = RevIN(c_in, affine=True, subtract_last=False)
 
+        # Moving Average
         self.ma_type = configs.ma_type
-        self.decomp  = DECOMP(self.ma_type, configs.alpha, configs.beta)
+        alpha = configs.alpha
+        beta = configs.beta
 
-        vgm_ff = getattr(configs, 'vgm_ff', pred_len)
-
-        self.net = GLPatchNetwork(
-            seq_len, pred_len, patch_len, stride, padding_patch,
-            channel=c_in,
-            vgm_ff=vgm_ff,
-        )
+        self.decomp = DECOMP(self.ma_type, alpha, beta)
+        self.net = GLPatchNetwork(seq_len, pred_len, patch_len, stride,
+                                  padding_patch)
 
     def forward(self, x):
+        # x: [Batch, Input, Channel]
+
+        # Normalization
         if self.revin:
             x = self.revin_layer(x, 'norm')
 
@@ -50,6 +59,7 @@ class Model(nn.Module):
             seasonal_init, trend_init = self.decomp(x)
             x = self.net(seasonal_init, trend_init)
 
+        # Denormalization
         if self.revin:
             x = self.revin_layer(x, 'denorm')
 
