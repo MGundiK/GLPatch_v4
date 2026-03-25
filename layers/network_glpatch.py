@@ -43,42 +43,44 @@ class VariateWiseGating(nn.Module):
     """
     Mean-pool VGM operating on the MLP trend stream output.
 
-    WHY pred_len SPACE WORKS HERE (unlike v9.0)
-    --------------------------------------------
-    v9.0 failed because it used Linear(2C) across channels — lossy bottleneck
-    for large C. The GatingBlock size scaled with C, breaking Traffic/Electricity.
+    PARAMETER SCALING FIX (v9.3)
+    ----------------------------
+    Previous default: vgm_ff=pred_len → out_proj was Linear(pred_len, pred_len).
+    At pred_len=720 this adds 2.6M parameters, causing overfit on small-C
+    datasets (ETTh1 has ~8700 training samples with C=7).
 
-    Here the GatingBlock is always GatingBlock(2*pred_len, vgm_ff) — constant
-    regardless of C. For pred_len=96: 192-dim. For pred_len=720: 1440-dim.
-    C=7 or C=862, same module size. No bottleneck, no C-dependent scaling.
+    Fix: vgm_ff is capped at 64 by default. out_proj is now a bottleneck:
+        pred_len → vgm_ff → pred_len   (two small linears, not one huge one)
 
-    WHY MEAN-POOL IS STABLE IN pred_len SPACE
-    ------------------------------------------
-    The xPatch MLP has already processed each channel's full temporal sequence
-    into a pred_len-dimensional prediction embedding. Mean-pooling these
-    embeddings across C channels gives a meaningful global forecast context:
-    the "average prediction" across all channels, which captures shared
-    temporal patterns and common trends. This is a 96-dim or 720-dim vector —
-    rich, not a scalar — so the mean is stable even for C=7.
+    Parameter comparison (pred_len=720):
+        Before: GatingBlock(1440,720) + Linear(720,720) = 2,594,880
+        After:  GatingBlock(1440,64)  + Linear(720,64) + Linear(64,720) = 704,944
+
+    The GatingBlock input is still 2*pred_len (full cross-channel context),
+    only the bottleneck dimension is capped. This preserves representational
+    richness in the gating while dramatically reducing out_proj parameters.
 
     ZERO-INIT RESIDUAL
     ------------------
-    out_proj is zero-initialized: at init, VGM output = 0, module is identity.
-    The model first learns to match v8 (MLP trend) performance, then gradually
-    learns to use cross-channel signal. Cannot hurt at initialization.
+    out_proj[-1] (the last linear) is zero-initialized: VGM starts as exact
+    identity at initialization regardless of pred_len. Cannot hurt at init.
 
     Args:
-        pred_len (int): prediction horizon (GatingBlock input dim = 2*pred_len)
-        vgm_ff   (int): GatingBlock hidden dim, default pred_len
+        pred_len (int): prediction horizon
+        vgm_ff   (int): bottleneck dim for GatingBlock and out_proj (default 64)
     """
-    def __init__(self, pred_len, vgm_ff=None):
+    def __init__(self, pred_len, vgm_ff=64):
         super(VariateWiseGating, self).__init__()
-        if vgm_ff is None:
-            vgm_ff = pred_len
-        self.gating   = GatingBlock(2 * pred_len, vgm_ff)
-        self.out_proj = nn.Linear(pred_len, pred_len)
-        nn.init.zeros_(self.out_proj.weight)
-        nn.init.zeros_(self.out_proj.bias)
+        self.gating  = GatingBlock(2 * pred_len, vgm_ff)
+        # Bottleneck projection: pred_len → vgm_ff → pred_len
+        self.out_proj = nn.Sequential(
+            nn.Linear(pred_len, vgm_ff),
+            nn.GELU(),
+            nn.Linear(vgm_ff, pred_len),
+        )
+        # Zero-init the last layer only — identity residual at init
+        nn.init.zeros_(self.out_proj[-1].weight)
+        nn.init.zeros_(self.out_proj[-1].bias)
 
     def forward(self, t):
         """
