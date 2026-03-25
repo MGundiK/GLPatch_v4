@@ -32,7 +32,7 @@ class Model(nn.Module):
         self.ma_type = configs.ma_type
         self.decomp  = DECOMP(self.ma_type, configs.alpha, configs.beta)
 
-        vgm_ff = getattr(configs, 'vgm_ff', pred_len)
+        vgm_ff = getattr(configs, 'vgm_ff', 64)
 
         self.net = GLPatchNetwork(
             seq_len, pred_len, patch_len, stride, padding_patch,
