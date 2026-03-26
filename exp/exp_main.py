@@ -26,7 +26,7 @@ class Exp_Main(Exp_Basic):
         model_dict = {
             'xPatch': xPatch,
             'GLPatch': GLPatch,
-            'GLPatch_tgm_only':GLPatch_tgm_only
+            'GLPatch_tgm_only': GLPatch_tgm_only
         }
         model = model_dict[self.args.model].Model(self.args).float()
 
@@ -39,7 +39,40 @@ class Exp_Main(Exp_Basic):
         return data_set, data_loader
 
     def _select_optimizer(self):
-        model_optim = optim.AdamW(self.model.parameters(), lr=self.args.learning_rate)
+        # ── Per-parameter-group LR ────────────────────────────────────────────
+        # The VGM (VariateWiseGating) is zero-initialized and needs to build up
+        # gradient signal from scratch while the rest of the model is already
+        # well-conditioned from v8. Giving VGM params a higher LR (×10) allows
+        # them to learn at the same effective rate as the pre-existing parameters
+        # without requiring extra epochs or inflated patience.
+        #
+        # vgm_lr_mult: multiplier applied to VGM params (default 10).
+        # Falls back to standard single-group optimizer for all non-v9 models
+        # (no 'vgm' params → vgm_params is empty → single-group used instead).
+        # ─────────────────────────────────────────────────────────────────────
+        vgm_lr_mult = getattr(self.args, 'vgm_lr_mult', 10)
+        base_lr     = self.args.learning_rate
+        vgm_lr      = base_lr * vgm_lr_mult
+
+        vgm_params  = [(n, p) for n, p in self.model.named_parameters()
+                       if 'vgm' in n]
+        base_params = [(n, p) for n, p in self.model.named_parameters()
+                       if 'vgm' not in n]
+
+        if vgm_params:
+            print(f"  Optimizer: {len(base_params)} base params lr={base_lr:.2e}  |  "
+                  f"{len(vgm_params)} VGM params lr={vgm_lr:.2e} (×{vgm_lr_mult})")
+            model_optim = optim.AdamW([
+                {'params': [p for _, p in base_params], 'lr': base_lr,  'initial_lr': base_lr},
+                {'params': [p for _, p in vgm_params],  'lr': vgm_lr,   'initial_lr': vgm_lr},
+            ])
+        else:
+            # Non-v9 models: standard single-group optimizer (identical to before)
+            model_optim = optim.AdamW(self.model.parameters(), lr=base_lr)
+            # Set initial_lr so adjust_learning_rate works uniformly
+            for pg in model_optim.param_groups:
+                pg['initial_lr'] = base_lr
+
         return model_optim
 
     def _select_criterion(self):
