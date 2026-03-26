@@ -17,14 +17,14 @@ def adjust_learning_rate(optimizer, epoch, args):
         }
     elif args.lradj == 'type3':
         lr_adjust = {epoch: args.learning_rate if epoch < 3 else args.learning_rate * (0.9 ** ((epoch - 3) // 1))}
-    
+
     # Sigmoid learning rate decay
     elif args.lradj == 'sigmoid':
         k = 0.5 # logistic growth rate
         s = 10  # decreasing curve smoothing rate
         w = 10  # warm-up coefficient
         lr_adjust = {epoch: args.learning_rate / (1 + np.exp(-k * (epoch - w))) - args.learning_rate / (1 + np.exp(-k/s * (epoch - w*s)))}
-    
+
     elif args.lradj == 'constant':
         lr_adjust = {epoch: args.learning_rate}
     elif args.lradj == '3':
@@ -34,12 +34,32 @@ def adjust_learning_rate(optimizer, epoch, args):
     elif args.lradj == '5':
         lr_adjust = {epoch: args.learning_rate if epoch < 25 else args.learning_rate*0.1}
     elif args.lradj == '6':
-        lr_adjust = {epoch: args.learning_rate if epoch < 5 else args.learning_rate*0.1}  
- 
+        lr_adjust = {epoch: args.learning_rate if epoch < 5 else args.learning_rate*0.1}
+
     if epoch in lr_adjust.keys():
         lr = lr_adjust[epoch]
+
+        # ── Per-group LR scaling ──────────────────────────────────────────────
+        # The scheduler computes a new base LR from args.learning_rate.
+        # For models with per-parameter-group LRs (e.g. GLPatch v9 with VGM),
+        # each group's initial LR may differ from args.learning_rate (e.g. VGM
+        # gets args.learning_rate × vgm_lr_mult).
+        #
+        # Setting all groups to the same absolute `lr` would overwrite the VGM's
+        # higher initial LR, collapsing all groups to the base schedule.
+        #
+        # Fix: compute the scale factor (new_lr / base_lr) and multiply each
+        # group's current LR by that ratio. This preserves the relative
+        # differences set at optimizer construction while applying the same
+        # decay curve to every group.
+        #
+        # For single-group optimizers this is mathematically identical to the
+        # original behaviour (scale × base_lr = new_lr).
+        # ─────────────────────────────────────────────────────────────────────
+        scale = lr / args.learning_rate
         for param_group in optimizer.param_groups:
-            param_group['lr'] = lr
+            param_group['lr'] = param_group['initial_lr'] * scale
+
         print('Updating learning rate to {}'.format(lr))
 
 
